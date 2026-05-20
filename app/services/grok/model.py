@@ -35,6 +35,11 @@ class ModelInfo(BaseModel):
     description: str = ""
     is_video: bool = False
     is_image: bool = False
+    # 非空时通过 console.x.ai/v1/responses 调用，值为发送给 console 的 model id
+    console_model: str = ""
+
+    def is_console(self) -> bool:
+        return bool(self.console_model)
 
 
 class ModelService:
@@ -137,6 +142,63 @@ class ModelService:
             model_mode="MODEL_MODE_GROK_420",
             cost=Cost.LOW,
             display_name="Grok 4.20 Beta"
+        ),
+        # === Console API (console.x.ai/v1/responses) ===
+        # 通过 grok.com 的 SSO cookie 直接调用 console.x.ai，basic 池即可使用
+        # 速率限制由 console.x.ai 控制（免费 tier: 1 rps / 60 RPM）
+        ModelInfo(
+            model_id="grok-4.3",
+            grok_model="grok-4.3",
+            rate_limit_model="grok-4",
+            model_mode="MODEL_MODE_FAST",
+            cost=Cost.LOW,
+            display_name="Grok 4.3 (Console)",
+            console_model="grok-4.3",
+        ),
+        ModelInfo(
+            model_id="grok-4-console",
+            grok_model="grok-4",
+            rate_limit_model="grok-4",
+            model_mode="MODEL_MODE_FAST",
+            cost=Cost.LOW,
+            display_name="Grok 4 (Console)",
+            console_model="grok-4",
+        ),
+        ModelInfo(
+            model_id="grok-4.20",
+            grok_model="grok-4.20",
+            rate_limit_model="grok-4",
+            model_mode="MODEL_MODE_FAST",
+            cost=Cost.LOW,
+            display_name="Grok 4.20 (Console)",
+            console_model="grok-4.20",
+        ),
+        ModelInfo(
+            model_id="grok-4.20-reasoning",
+            grok_model="grok-4.20-0309-reasoning",
+            rate_limit_model="grok-4",
+            model_mode="MODEL_MODE_FAST",
+            cost=Cost.LOW,
+            display_name="Grok 4.20 Reasoning (Console)",
+            console_model="grok-4.20-0309-reasoning",
+        ),
+        ModelInfo(
+            model_id="grok-4.20-non-reasoning",
+            grok_model="grok-4.20-0309-non-reasoning",
+            rate_limit_model="grok-4",
+            model_mode="MODEL_MODE_FAST",
+            cost=Cost.LOW,
+            display_name="Grok 4.20 Non-Reasoning (Console)",
+            console_model="grok-4.20-0309-non-reasoning",
+        ),
+        ModelInfo(
+            model_id="grok-4.20-multi-agent",
+            grok_model="grok-4.20-multi-agent-0309",
+            rate_limit_model="grok-4",
+            model_mode="MODEL_MODE_FAST",
+            cost=Cost.LOW,
+            display_name="Grok 4.20 Multi-Agent (Console)",
+            console_model="grok-4.20-multi-agent-0309",
         ),
         ModelInfo(
             model_id="grok-imagine-1.0",

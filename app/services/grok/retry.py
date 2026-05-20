@@ -27,7 +27,8 @@ class RetryConfig:
     @staticmethod
     def get_retry_codes() -> List[int]:
         """获取可重试的状态码"""
-        return get_config("grok.retry_status_codes", [401, 429, 403])
+        # 402 = console.x.ai 账号额度耗尽，按限流处理触发账号轮换
+        return get_config("grok.retry_status_codes", [401, 402, 429, 403])
 
 
 class RetryContext:

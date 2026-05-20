@@ -9,11 +9,14 @@ from typing import Any, AsyncGenerator
 import orjson
 
 from app.core.config import get_config
+from app.core.exceptions import UpstreamException
+from app.core.logger import logger
 from app.services.compat.common import (
     ChatArtifacts,
     finalize_chat_request,
     iterate_chat_events,
     prepare_chat_request,
+    require_chat_model,
 )
 from app.services.compat.media import render_generated_image
 from app.services.compat.tooling import ParsedToolCall, ToolSieve
@@ -22,6 +25,9 @@ from app.services.compat.usage import (
     estimate_tokens,
     estimate_tool_call_tokens,
 )
+from app.services.grok.console import console_chat_completions
+from app.services.request_stats import request_stats
+from app.services.token import get_token_manager
 
 
 def make_chat_response_id() -> str:
@@ -117,6 +123,16 @@ async def chat_completions(
     tools: list[dict[str, Any]] | None = None,
     tool_choice: Any = None,
 ) -> dict | AsyncGenerator[str, None]:
+    model_info = require_chat_model(model)
+    if model_info.is_console():
+        return await _console_completions(
+            model_info=model_info,
+            messages=messages,
+            stream=stream,
+            tools=tools,
+            tool_choice=tool_choice,
+        )
+
     emit_think = _resolve_emit_think(thinking)
     prepared = await prepare_chat_request(
         model=model,
@@ -129,6 +145,76 @@ async def chat_completions(
         artifacts = await _collect_completion(prepared, emit_think=emit_think)
         return make_tool_response(model, artifacts) if artifacts.tool_calls else make_chat_response(model, artifacts)
     return _stream_completion(prepared, emit_think=emit_think)
+
+
+async def _console_completions(
+    *,
+    model_info,
+    messages: list[dict[str, Any]],
+    stream: bool | None,
+    tools: list[dict[str, Any]] | None,
+    tool_choice: Any,
+) -> dict | AsyncGenerator[str, None]:
+    """通过 console.x.ai 路由 console 模型。"""
+    is_stream = stream if stream is not None else bool(get_config("grok.stream", True))
+    model_id = model_info.model_id
+
+    token_manager = await get_token_manager()
+    await token_manager.reload_if_stale()
+    token = token_manager.get_token_for_model(model_id)
+    if not token:
+        await _safe_record(model_id, success=False)
+        raise UpstreamException(
+            message="No available tokens. Please try again later.",
+            details={"status": 429},
+        )
+
+    success = False
+    try:
+        try:
+            result = await console_chat_completions(
+                token=token,
+                console_model=model_info.console_model,
+                response_model=model_id,
+                messages=messages,
+                stream=bool(is_stream),
+                tools=tools,
+                tool_choice=tool_choice,
+            )
+        except UpstreamException as exc:
+            status = (exc.details or {}).get("status") if exc.details else None
+            if status:
+                await token_manager.record_fail(token, status, str(exc))
+            await _safe_record(model_id, success=False)
+            raise
+
+        if not is_stream:
+            success = True
+            await _safe_record(model_id, success=True)
+            return result
+
+        async def _wrapped() -> AsyncGenerator[str, None]:
+            completed = False
+            try:
+                async for chunk in result:
+                    yield chunk
+                completed = True
+            finally:
+                await _safe_record(model_id, success=completed)
+
+        success = True
+        return _wrapped()
+    finally:
+        if not success:
+            # 同步 quota 仅在非 console 路径维护；console 失败时不再二次扣减
+            pass
+
+
+async def _safe_record(model: str, *, success: bool) -> None:
+    try:
+        await request_stats.record_request(model, success=success)
+    except Exception as exc:
+        logger.debug("record_request failed: {}", exc)
 
 
 async def _collect_completion(prepared, *, emit_think: bool) -> ChatArtifacts:

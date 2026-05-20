@@ -156,6 +156,13 @@ class TokenInfo(BaseModel):
     
     def record_fail(self, status_code: int = 401, reason: str = ""):
         """记录失败，达到阈值后自动标记为 expired"""
+        # 402 = console.x.ai 额度耗尽，进入冷却以触发账号池轮换
+        if status_code == 402:
+            self.last_fail_at = int(datetime.now().timestamp() * 1000)
+            self.last_fail_reason = reason or "console_credits_exhausted"
+            self.status = TokenStatus.COOLING
+            return
+
         # 仅 401 错误才计入失败
         if status_code != 401:
             return

@@ -362,6 +362,12 @@ class TokenManager:
                         f"Token {raw_token[:10]}...: recorded 401 failure "
                         f"({token.fail_count}/{FAIL_THRESHOLD}) - {reason}"
                     )
+                elif status_code == 402:
+                    token.record_fail(status_code, reason)
+                    logger.warning(
+                        f"Token {raw_token[:10]}...: console credits exhausted (402), "
+                        f"marked cooling - {reason}"
+                    )
                 else:
                     logger.info(
                         f"Token {raw_token[:10]}...: non-401 error ({status_code}) - {reason} (not counted)"
