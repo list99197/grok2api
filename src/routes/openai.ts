@@ -3,11 +3,12 @@ import { cors } from "hono/cors";
 import type { Env } from "../env";
 import { requireApiAuth } from "../auth";
 import { getSettings, normalizeCfCookie } from "../settings";
-import { isValidModel, MODEL_CONFIG } from "../grok/models";
+import { isValidModel, MODEL_CONFIG, isConsoleModel, getConsoleModel } from "../grok/models";
 import { extractContent, buildConversationPayload, sendConversationRequest } from "../grok/conversation";
 import { uploadImage } from "../grok/upload";
 import { getDynamicHeaders } from "../grok/headers";
 import { createMediaPost, createPost } from "../grok/create";
+import { consoleChatCompletions, ConsoleError, buildConsoleArgs } from "../grok/console";
 import {
   buildAnthropicJsonFromChat,
   buildResponsesJsonFromChat,
@@ -1028,6 +1029,121 @@ function streamHeaders(): Record<string, string> {
   };
 }
 
+// === Console (console.x.ai) chat 路径 ===
+// 适用于 isConsoleModel(model) 的模型；不上传图片、不构造 grok.com payload，
+// 直接用 SSO cookie 调用 console.x.ai/v1/responses 并翻译回 OpenAI 格式。
+interface ConsoleChatRouteArgs {
+  c: any;
+  ip: string;
+  keyName: string;
+  requestedModel: string;
+  messages: any[];
+  stream: boolean;
+  tools?: Array<Record<string, unknown>>;
+  toolChoice?: unknown;
+}
+
+async function runConsoleChat(args: ConsoleChatRouteArgs): Promise<Response> {
+  const { c, ip, keyName, requestedModel, messages, stream, tools, toolChoice } = args;
+  const start = Date.now();
+  const settingsBundle = await getSettings(c.env);
+  const retryCodes = Array.isArray(settingsBundle.grok.retry_status_codes)
+    ? settingsBundle.grok.retry_status_codes
+    : [401, 402, 429, 403];
+  const consoleModel = getConsoleModel(requestedModel);
+  if (!consoleModel) {
+    return c.json(openAiError(`Model '${requestedModel}' is not a console model`, "internal_error"), 500);
+  }
+
+  const maxRetry = 3;
+  let lastErr: string | null = null;
+
+  for (let attempt = 0; attempt < maxRetry; attempt += 1) {
+    const chosen = await selectBestToken(c.env.DB, requestedModel);
+    if (!chosen) return c.json(openAiError("No available token", "NO_AVAILABLE_TOKEN"), 503);
+    const tokenSuffix = chosen.token.slice(-6);
+
+    try {
+      const consoleArgs = buildConsoleArgs({
+        token: chosen.token,
+        consoleModel,
+        responseModel: requestedModel,
+        messages,
+        stream,
+        ...(tools ? { tools: tools as any[] } : {}),
+        ...(toolChoice !== undefined ? { toolChoice } : {}),
+        settings: settingsBundle.grok,
+      });
+      const result = await consoleChatCompletions(consoleArgs);
+
+      if (stream) {
+        const sseStream = result as ReadableStream<Uint8Array>;
+        const loggedStream = sseStream.pipeThrough(
+          new TransformStream<Uint8Array, Uint8Array>({
+            flush: async () => {
+              await addRequestLog(c.env.DB, {
+                ip,
+                model: requestedModel,
+                duration: Number(((Date.now() - start) / 1000).toFixed(2)),
+                status: 200,
+                key_name: keyName,
+                token_suffix: tokenSuffix,
+                error: "",
+              });
+            },
+          }),
+        );
+        return new Response(loggedStream, { status: 200, headers: streamHeaders() });
+      }
+
+      await addRequestLog(c.env.DB, {
+        ip,
+        model: requestedModel,
+        duration: Number(((Date.now() - start) / 1000).toFixed(2)),
+        status: 200,
+        key_name: keyName,
+        token_suffix: tokenSuffix,
+        error: "",
+      });
+      return c.json(result);
+    } catch (err) {
+      if (err instanceof ConsoleError) {
+        lastErr = `Console ${err.status}: ${err.body.slice(0, 200) || err.message}`;
+        await recordTokenFailure(c.env.DB, chosen.token, err.status, lastErr.slice(0, 200));
+        await applyCooldown(c.env.DB, chosen.token, err.status);
+        if (retryCodes.includes(err.status) && attempt < maxRetry - 1) continue;
+        await addRequestLog(c.env.DB, {
+          ip,
+          model: requestedModel,
+          duration: Number(((Date.now() - start) / 1000).toFixed(2)),
+          status: err.status,
+          key_name: keyName,
+          token_suffix: tokenSuffix,
+          error: lastErr ?? "console_error",
+        });
+        return c.json(openAiError(lastErr ?? err.message, "upstream_error"), 502);
+      }
+      const msg = err instanceof Error ? err.message : String(err);
+      lastErr = msg;
+      await recordTokenFailure(c.env.DB, chosen.token, 500, msg);
+      await applyCooldown(c.env.DB, chosen.token, 500);
+      if (attempt < maxRetry - 1) continue;
+      await addRequestLog(c.env.DB, {
+        ip,
+        model: requestedModel,
+        duration: Number(((Date.now() - start) / 1000).toFixed(2)),
+        status: 500,
+        key_name: keyName,
+        token_suffix: tokenSuffix,
+        error: msg,
+      });
+      return c.json(openAiError(msg, "internal_error"), 500);
+    }
+  }
+
+  return c.json(openAiError(lastErr ?? "Upstream error", "upstream_error"), 502);
+}
+
 function isValidImageModel(model: string): boolean {
   if (!isValidModel(model)) return false;
   const cfg = MODEL_CONFIG[model];
@@ -1279,6 +1395,20 @@ openAiRoutes.post("/chat/completions", async (c) => {
     });
     if (!quota.ok) return quota.resp;
 
+    // Console (console.x.ai) 路径：跳过 grok.com conversation 流程
+    if (isConsoleModel(requestedModel)) {
+      return await runConsoleChat({
+        c,
+        ip,
+        keyName,
+        requestedModel,
+        messages: body.messages as any[],
+        stream,
+        ...(body.tools ? { tools: body.tools } : {}),
+        ...(body.tool_choice !== undefined ? { toolChoice: body.tool_choice } : {}),
+      });
+    }
+
     for (let attempt = 0; attempt < maxRetry; attempt++) {
       const chosen = await selectBestToken(c.env.DB, requestedModel);
       if (!chosen) return c.json(openAiError("No available token", "NO_AVAILABLE_TOKEN"), 503);
@@ -1472,6 +1602,90 @@ openAiRoutes.post("/responses", async (c) => {
       kind: "chat",
     });
     if (!quota.ok) return quota.resp;
+
+    // Console (console.x.ai) 路径：把 console chat 输出再包装为 Responses 格式
+    if (isConsoleModel(requestedModel)) {
+      const startedAt = Date.now();
+      const consoleModel = getConsoleModel(requestedModel);
+      for (let attempt = 0; attempt < 3; attempt += 1) {
+        const chosen = await selectBestToken(c.env.DB, requestedModel);
+        if (!chosen) return c.json(openAiError("No available token", "NO_AVAILABLE_TOKEN"), 503);
+        const tokenSuffix = chosen.token.slice(-6);
+        try {
+          const consoleArgs = buildConsoleArgs({
+            token: chosen.token,
+            consoleModel,
+            responseModel: requestedModel,
+            messages: messages as any,
+            stream,
+            ...(normalizedTools && normalizedTools.length ? { tools: normalizedTools as any[] } : {}),
+            ...(toolChoice !== undefined ? { toolChoice } : {}),
+            settings: settingsBundle.grok,
+          });
+          const result = await consoleChatCompletions(consoleArgs);
+          if (stream) {
+            const openAiStream = result as ReadableStream<Uint8Array>;
+            await addRequestLog(c.env.DB, {
+              ip,
+              model: requestedModel,
+              duration: Number(((Date.now() - startedAt) / 1000).toFixed(2)),
+              status: 200,
+              key_name: keyName,
+              token_suffix: tokenSuffix,
+              error: "",
+            });
+            return new Response(createResponsesStreamFromChatStream(openAiStream, requestedModel), {
+              status: 200,
+              headers: streamHeaders(),
+            });
+          }
+          const chatJson = result as Record<string, unknown>;
+          await addRequestLog(c.env.DB, {
+            ip,
+            model: requestedModel,
+            duration: Number(((Date.now() - startedAt) / 1000).toFixed(2)),
+            status: 200,
+            key_name: keyName,
+            token_suffix: tokenSuffix,
+            error: "",
+          });
+          return c.json(buildResponsesJsonFromChat(requestedModel, chatJson));
+        } catch (err) {
+          if (err instanceof ConsoleError) {
+            lastErr = `Console ${err.status}: ${err.body.slice(0, 200) || err.message}`;
+            await recordTokenFailure(c.env.DB, chosen.token, err.status, lastErr.slice(0, 200));
+            await applyCooldown(c.env.DB, chosen.token, err.status);
+            if (retryCodes.includes(err.status) && attempt < 2) continue;
+            await addRequestLog(c.env.DB, {
+              ip,
+              model: requestedModel,
+              duration: Number(((Date.now() - startedAt) / 1000).toFixed(2)),
+              status: err.status,
+              key_name: keyName,
+              token_suffix: tokenSuffix,
+              error: lastErr ?? "console_error",
+            });
+            return c.json(openAiError(lastErr ?? err.message, "upstream_error"), 502);
+          }
+          const msg = err instanceof Error ? err.message : String(err);
+          lastErr = msg;
+          await recordTokenFailure(c.env.DB, chosen.token, 500, msg);
+          await applyCooldown(c.env.DB, chosen.token, 500);
+          if (attempt < 2) continue;
+          await addRequestLog(c.env.DB, {
+            ip,
+            model: requestedModel,
+            duration: Number(((Date.now() - startedAt) / 1000).toFixed(2)),
+            status: 500,
+            key_name: keyName,
+            token_suffix: tokenSuffix,
+            error: msg,
+          });
+          return c.json(openAiError(msg, "internal_error"), 500);
+        }
+      }
+      return c.json(openAiError(lastErr ?? "Upstream error", "upstream_error"), 502);
+    }
 
     for (let attempt = 0; attempt < 3; attempt += 1) {
       const chosen = await selectBestToken(c.env.DB, requestedModel);

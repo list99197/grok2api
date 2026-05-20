@@ -10,6 +10,8 @@ export interface ModelInfo {
   default_top_p: number;
   is_image_model?: boolean;
   is_video_model?: boolean;
+  // 非空时通过 console.x.ai/v1/responses 调用，值为发送给 console 的 model id
+  console_model?: string;
 }
 
 export const MODEL_CONFIG: Record<string, ModelInfo> = {
@@ -145,6 +147,80 @@ export const MODEL_CONFIG: Record<string, ModelInfo> = {
     supported_max_output_tokens: 131072,
     default_top_p: 0.95,
   },
+  // === Console API (console.x.ai/v1/responses) ===
+  // 通过 grok.com 的 SSO cookie 直接调用 console.x.ai，basic 池即可使用
+  "grok-4.3": {
+    grok_model: ["grok-4.3", "MODEL_MODE_FAST"],
+    rate_limit_model: "grok-4",
+    display_name: "Grok 4.3 (Console)",
+    description: "Grok 4.3 via console.x.ai",
+    raw_model_path: "xai/grok-4.3",
+    default_temperature: 1.0,
+    default_max_output_tokens: 8192,
+    supported_max_output_tokens: 131072,
+    default_top_p: 0.95,
+    console_model: "grok-4.3",
+  },
+  "grok-4-console": {
+    grok_model: ["grok-4", "MODEL_MODE_FAST"],
+    rate_limit_model: "grok-4",
+    display_name: "Grok 4 (Console)",
+    description: "Grok 4 via console.x.ai",
+    raw_model_path: "xai/grok-4",
+    default_temperature: 1.0,
+    default_max_output_tokens: 8192,
+    supported_max_output_tokens: 131072,
+    default_top_p: 0.95,
+    console_model: "grok-4",
+  },
+  "grok-4.20": {
+    grok_model: ["grok-4.20", "MODEL_MODE_FAST"],
+    rate_limit_model: "grok-4",
+    display_name: "Grok 4.20 (Console)",
+    description: "Grok 4.20 via console.x.ai",
+    raw_model_path: "xai/grok-4.20",
+    default_temperature: 1.0,
+    default_max_output_tokens: 8192,
+    supported_max_output_tokens: 131072,
+    default_top_p: 0.95,
+    console_model: "grok-4.20",
+  },
+  "grok-4.20-reasoning": {
+    grok_model: ["grok-4.20-0309-reasoning", "MODEL_MODE_FAST"],
+    rate_limit_model: "grok-4",
+    display_name: "Grok 4.20 Reasoning (Console)",
+    description: "Grok 4.20 reasoning via console.x.ai",
+    raw_model_path: "xai/grok-4.20-0309-reasoning",
+    default_temperature: 1.0,
+    default_max_output_tokens: 8192,
+    supported_max_output_tokens: 131072,
+    default_top_p: 0.95,
+    console_model: "grok-4.20-0309-reasoning",
+  },
+  "grok-4.20-non-reasoning": {
+    grok_model: ["grok-4.20-0309-non-reasoning", "MODEL_MODE_FAST"],
+    rate_limit_model: "grok-4",
+    display_name: "Grok 4.20 Non-Reasoning (Console)",
+    description: "Grok 4.20 non-reasoning via console.x.ai",
+    raw_model_path: "xai/grok-4.20-0309-non-reasoning",
+    default_temperature: 1.0,
+    default_max_output_tokens: 8192,
+    supported_max_output_tokens: 131072,
+    default_top_p: 0.95,
+    console_model: "grok-4.20-0309-non-reasoning",
+  },
+  "grok-4.20-multi-agent": {
+    grok_model: ["grok-4.20-multi-agent-0309", "MODEL_MODE_FAST"],
+    rate_limit_model: "grok-4",
+    display_name: "Grok 4.20 Multi-Agent (Console)",
+    description: "Grok 4.20 multi-agent via console.x.ai",
+    raw_model_path: "xai/grok-4.20-multi-agent-0309",
+    default_temperature: 1.0,
+    default_max_output_tokens: 8192,
+    supported_max_output_tokens: 131072,
+    default_top_p: 0.95,
+    console_model: "grok-4.20-multi-agent-0309",
+  },
   "grok-imagine-1.0": {
     grok_model: ["grok-3", "MODEL_MODE_FAST"],
     rate_limit_model: "grok-3",
@@ -199,5 +275,13 @@ export function toGrokModel(model: string): { grokModel: string; mode: string; i
 
 export function toRateLimitModel(model: string): string {
   return MODEL_CONFIG[model]?.rate_limit_model ?? model;
+}
+
+export function isConsoleModel(model: string): boolean {
+  return Boolean(MODEL_CONFIG[model]?.console_model);
+}
+
+export function getConsoleModel(model: string): string {
+  return MODEL_CONFIG[model]?.console_model ?? "";
 }
 
