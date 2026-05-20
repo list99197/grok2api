@@ -248,49 +248,6 @@ export class ConsoleError extends Error {
 // 非流式响应解析
 // ---------------------------------------------------------------------------
 
-function extractText(data: Json): string {
-  for (const item of (data.output as Json[]) ?? []) {
-    if (!item || typeof item !== "object" || item.type !== "message") continue;
-    for (const c of (item.content as Json[]) ?? []) {
-      if (c && typeof c === "object" && c.type === "output_text") return String(c.text ?? "");
-    }
-  }
-  return "";
-}
-
-function extractReasoning(data: Json): string {
-  for (const item of (data.output as Json[]) ?? []) {
-    if (!item || typeof item !== "object" || item.type !== "reasoning") continue;
-    const parts: string[] = [];
-    for (const s of (item.summary as Json[]) ?? []) {
-      if (s && typeof s === "object") {
-        const text = String((s as Json).text ?? (s as Json).content ?? "");
-        if (text) parts.push(text);
-      } else if (typeof s === "string") {
-        parts.push(s);
-      }
-    }
-    return parts.join("\n");
-  }
-  return "";
-}
-
-function extractToolCalls(data: Json): ToolCall[] {
-  const calls: ToolCall[] = [];
-  for (const item of (data.output as Json[]) ?? []) {
-    if (!item || typeof item !== "object" || item.type !== "function_call") continue;
-    calls.push({
-      id: String(item.call_id ?? item.id ?? ""),
-      type: "function",
-      function: {
-        name: String(item.name ?? ""),
-        arguments: String(item.arguments ?? "{}"),
-      },
-    });
-  }
-  return calls;
-}
-
 function extractUsage(data: Json): Json {
   const usage = (data.usage as Json) ?? {};
   const prompt = Number(usage.input_tokens ?? 0) | 0;
@@ -308,34 +265,6 @@ function extractUsage(data: Json): Json {
 function makeChatId(): string {
   const uuid = crypto.randomUUID().replace(/-/g, "");
   return `chatcmpl-${uuid.slice(0, 24)}`;
-}
-
-function buildChatCompletion(model: string, data: Json): Json {
-  const text = extractText(data);
-  const reasoning = extractReasoning(data);
-  const toolCalls = extractToolCalls(data);
-  const usage = extractUsage(data);
-
-  const message: Json = { role: "assistant" };
-  let finishReason: string;
-  if (toolCalls.length) {
-    message.content = null;
-    message.tool_calls = toolCalls;
-    finishReason = "tool_calls";
-  } else {
-    message.content = text;
-    if (reasoning) message.reasoning_content = reasoning;
-    finishReason = "stop";
-  }
-
-  return {
-    id: makeChatId(),
-    object: "chat.completion",
-    created: Math.floor(Date.now() / 1000),
-    model,
-    choices: [{ index: 0, message, finish_reason: finishReason }],
-    usage,
-  };
 }
 
 // ---------------------------------------------------------------------------
@@ -479,10 +408,12 @@ export interface ConsoleChatArgs {
 export async function consoleChatCompletions(
   args: ConsoleChatArgs,
 ): Promise<Json | ReadableStream<Uint8Array>> {
+  // 始终以 stream=true 调用 console.x.ai，避免上游网关在等待完整响应时返回 504。
+  // 非流式由 worker 在内部把 SSE 聚合为 chat.completion 对象。
   const payload = buildPayload({
     consoleModel: args.consoleModel,
     messages: args.messages,
-    stream: args.stream,
+    stream: true,
     ...(args.tools ? { tools: args.tools } : {}),
     ...(args.toolChoice !== undefined ? { toolChoice: args.toolChoice } : {}),
   });
@@ -515,27 +446,144 @@ export async function consoleChatCompletions(
     );
   }
 
-  if (!args.stream) {
-    const text = await response.text();
-    let data: Json;
-    try {
-      data = JSON.parse(text);
-    } catch (exc) {
-      throw new ConsoleError(
-        "Console response is not valid JSON",
-        502,
-        "invalid_json",
-        text.slice(0, 400),
-      );
-    }
-    return buildChatCompletion(args.responseModel, data);
-  }
-
   if (!response.body) {
     throw new ConsoleError("Console response has no stream body", 502, "no_stream_body");
   }
 
+  if (!args.stream) {
+    return await aggregateConsoleStream(response.body, args.responseModel);
+  }
   return translateSseToChatStream(response.body, args.responseModel);
+}
+
+async function aggregateConsoleStream(upstream: ReadableStream<Uint8Array>, model: string): Promise<Json> {
+  const reader = upstream.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let currentEvent = "";
+  let text = "";
+  let reasoning = "";
+  let usage: Json | null = null;
+  const toolCalls: ToolCall[] = [];
+  const toolIndexById = new Map<string, number>();
+  const toolArgsBufById = new Map<string, string[]>();
+
+  const handleLine = (line: string): boolean => {
+    const classified = classifySseLine(line);
+    if (classified.kind === "event") {
+      currentEvent = classified.payload;
+      return false;
+    }
+    if (classified.kind !== "data") return false;
+    const data = classified.payload;
+    if (!data || data === "[DONE]") return true;
+    let obj: Json;
+    try {
+      obj = JSON.parse(data);
+    } catch {
+      return false;
+    }
+    if (!obj || typeof obj !== "object") return false;
+
+    const ev = currentEvent || String(obj.type ?? "");
+
+    if (ev === "response.output_text.delta") {
+      text += String(obj.delta ?? "");
+    } else if (ev === "response.reasoning_summary_text.delta" || ev === "response.reasoning_summary.delta") {
+      reasoning += String(obj.delta ?? "");
+    } else if (ev === "response.output_item.added") {
+      const item = (obj.item as Json) ?? {};
+      if (item && item.type === "function_call") {
+        const itemId = String(item.id ?? item.call_id ?? "");
+        const callId = String(item.call_id ?? itemId);
+        const name = String(item.name ?? "");
+        toolIndexById.set(itemId, toolCalls.length);
+        toolArgsBufById.set(itemId, []);
+        toolCalls.push({ id: callId, type: "function", function: { name, arguments: "" } });
+      }
+    } else if (ev === "response.function_call_arguments.delta") {
+      const itemId = String(obj.item_id ?? "");
+      const delta = String(obj.delta ?? "");
+      const idx = toolIndexById.get(itemId);
+      if (idx !== undefined && delta) {
+        toolArgsBufById.get(itemId)!.push(delta);
+      }
+    } else if (ev === "response.function_call_arguments.done") {
+      const itemId = String(obj.item_id ?? "");
+      const idx = toolIndexById.get(itemId);
+      if (idx !== undefined) {
+        let finalArgs = obj.arguments;
+        if (typeof finalArgs !== "string" || !finalArgs) {
+          finalArgs = (toolArgsBufById.get(itemId) ?? []).join("");
+        }
+        toolCalls[idx]!.function.arguments = String(finalArgs);
+      }
+    } else if (ev === "response.completed") {
+      const resp = (obj.response as Json) ?? {};
+      const u = (resp.usage as Json) ?? (obj.usage as Json) ?? null;
+      if (u) usage = u;
+      return true;
+    } else if (ev === "response.failed" || ev === "response.error" || ev === "error") {
+      const err = (obj.error as Json) ?? {};
+      const msg =
+        typeof err === "object" && err ? String((err as Json).message ?? "") : String(err);
+      throw new ConsoleError(msg || "Console stream error", 502, "upstream_error");
+    }
+    return false;
+  };
+
+  try {
+    let done = false;
+    while (!done) {
+      const { value, done: rdone } = await reader.read();
+      if (rdone) {
+        buffer += decoder.decode();
+        if (buffer.trim()) {
+          if (handleLine(buffer)) done = true;
+          buffer = "";
+        }
+        break;
+      }
+      buffer += decoder.decode(value, { stream: true });
+      while (true) {
+        const idx = buffer.indexOf("\n");
+        if (idx < 0) break;
+        const line = buffer.slice(0, idx);
+        buffer = buffer.slice(idx + 1);
+        if (handleLine(line)) {
+          done = true;
+          break;
+        }
+      }
+    }
+  } finally {
+    try {
+      reader.releaseLock();
+    } catch {
+      // ignore
+    }
+  }
+
+  const message: Json = { role: "assistant" };
+  let finishReason: string;
+  if (toolCalls.length) {
+    message.content = null;
+    message.tool_calls = toolCalls;
+    finishReason = "tool_calls";
+  } else {
+    message.content = text;
+    if (reasoning) message.reasoning_content = reasoning;
+    finishReason = "stop";
+  }
+
+  return {
+    id: makeChatId(),
+    object: "chat.completion",
+    created: Math.floor(Date.now() / 1000),
+    model,
+    choices: [{ index: 0, message, finish_reason: finishReason }],
+    usage: extractUsage(usage ? { usage } : {}),
+  };
 }
 
 function translateSseToChatStream(upstream: ReadableStream<Uint8Array>, model: string): ReadableStream<Uint8Array> {
